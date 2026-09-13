@@ -1,3 +1,4 @@
+import os
 import logging
 import traceback
 import torch
@@ -6,6 +7,7 @@ from .operations_triton import triton_int8_linear, triton_int8_linear_per_row
 from .quant_rotation import build_hadamard, rotate_activation
 
 logger = logging.getLogger("triton_int8_gemm")
+_EXT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _STATE = {
     "enabled": True,
@@ -25,7 +27,10 @@ _STATE = {
 
 
 def is_triton_gemm_enabled() -> bool:
-    return _STATE["enabled"]
+    """Returns True if Triton GEMM is enabled and not suppressed by .disabled flag."""
+    if os.path.exists(os.path.join(_EXT_DIR, ".disabled")):
+        return False
+    return _STATE.get("enabled", True)
 
 
 def set_triton_gemm_enabled(enabled: bool):
@@ -196,7 +201,7 @@ def apply_triton_gemm_patch():
             def triton_fused_linear_forward(self, input, *f_args, **f_kwargs):
                 _STATE["diagnostics"]["total_calls"] += 1
 
-                if not _STATE["enabled"]:
+                if not is_triton_gemm_enabled():
                     _record_fallback("disabled_by_user")
                     return original_forward(self, input, *f_args, **f_kwargs)
 

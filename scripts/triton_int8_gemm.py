@@ -10,6 +10,7 @@ import modules.scripts as scripts
 from triton_gemm.patcher import (
     apply_triton_gemm_patch,
     set_triton_gemm_enabled,
+    is_triton_gemm_enabled,
     get_triton_gemm_diagnostics,
     _STATE,
 )
@@ -20,6 +21,7 @@ apply_triton_gemm_patch()
 
 class TritonInt8GemmScript(scripts.Script):
     sorting_priority = 2024
+    alwayson = True
 
     def title(self):
         return "Triton INT8 Fused GEMM"
@@ -55,5 +57,31 @@ class TritonInt8GemmScript(scripts.Script):
         return [enable, per_row]
 
     def process(self, p, enable: bool = True, per_row: bool = False, *args, **kwargs):
-        set_triton_gemm_enabled(enable)
+        import time
+        from triton_gemm.patcher import reset_triton_gemm_diagnostics
+        reset_triton_gemm_diagnostics()
+        _STATE["gen_start_time"] = time.perf_counter()
+
+        # Master toggle: presence of .disabled file forces baseline fallback
+        if os.path.exists(os.path.join(ext_dir, ".disabled")):
+            active = False
+        else:
+            active = True
+
+        set_triton_gemm_enabled(active)
         _STATE["per_row_quant"] = per_row
+
+    def postprocess(self, p, processed, *args):
+        import json, time
+        diag = get_triton_gemm_diagnostics()
+        elapsed = time.perf_counter() - _STATE.get("gen_start_time", time.perf_counter())
+        diag["gen_elapsed_seconds"] = round(elapsed, 3)
+        if getattr(p, "steps", 0) > 0 and elapsed > 0:
+            diag["it_per_sec"] = round(p.steps / elapsed, 3)
+        diag["timestamp"] = time.time()
+        log_file = os.path.join(ext_dir, "benchmark_telemetry.json")
+        try:
+            with open(log_file, "w") as f:
+                json.dump(diag, f, indent=2)
+        except Exception:
+            pass

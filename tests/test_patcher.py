@@ -78,6 +78,35 @@ class TestTritonPatcher(unittest.TestCase):
         self.assertEqual(diag2["triton_calls"], 1)
         self.assertEqual(diag2["fallback_calls"], 0)
 
+    def test_disabled_toggle(self):
+        """Verify that creating .disabled cleanly forces fallback to baseline without crashing."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available for Triton tests")
+
+        ops = omp.mixed_precision_ops()
+        layer = ops.Linear(128, 256, bias=True).to("cuda", dtype=torch.bfloat16)
+        layer.layout_type = TensorWiseINT8Layout
+        layer.quant_format = "int8_tensorwise"
+        w = torch.randn(256, 128, dtype=torch.bfloat16, device="cuda")
+        layer.weight = QuantizedTensor.from_float(w, "TensorWiseINT8Layout")
+        layer.bias = torch.nn.Parameter(torch.randn(256, dtype=torch.bfloat16, device="cuda"))
+        x = torch.randn(2, 64, 128, dtype=torch.bfloat16, device="cuda")
+
+        flag_path = os.path.join(ext_dir, ".disabled")
+        try:
+            with open(flag_path, "w") as f:
+                f.write("1")
+            reset_triton_gemm_diagnostics()
+            out = layer(x)
+            diag = get_triton_gemm_diagnostics()
+            self.assertEqual(out.shape, (2, 64, 256))
+            self.assertEqual(diag["triton_calls"], 0)
+            self.assertEqual(diag["fallback_calls"], 1)
+            self.assertEqual(diag["fallback_reasons"].get("disabled_by_user"), 1)
+        finally:
+            if os.path.exists(flag_path):
+                os.remove(flag_path)
+
     def test_clean_unpatch(self):
         """Verify that remove_triton_gemm_patch cleanly restores original operations."""
         remove_triton_gemm_patch()
