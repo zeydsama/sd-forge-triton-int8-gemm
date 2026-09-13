@@ -1,4 +1,5 @@
 import logging
+import traceback
 import torch
 
 from .operations_triton import triton_int8_linear, triton_int8_linear_per_row
@@ -11,6 +12,15 @@ _STATE = {
     "patched": False,
     "orig_mixed_precision_ops": None,
     "per_row_quant": False,
+    "diagnostics": {
+        "total_calls": 0,
+        "triton_calls": 0,
+        "fallback_calls": 0,
+        "fallback_reasons": {},
+        "last_error": None,
+        "last_traceback": None,
+        "first_fallback_logged": False,
+    },
 }
 
 
@@ -20,6 +30,51 @@ def is_triton_gemm_enabled() -> bool:
 
 def set_triton_gemm_enabled(enabled: bool):
     _STATE["enabled"] = enabled
+
+
+def get_triton_gemm_diagnostics() -> dict:
+    """Returns runtime telemetry regarding Triton execution vs fallbacks."""
+    diag = dict(_STATE["diagnostics"])
+    diag["enabled"] = _STATE["enabled"]
+    diag["patched"] = _STATE["patched"]
+    diag["per_row_quant"] = _STATE["per_row_quant"]
+    return diag
+
+
+def reset_triton_gemm_diagnostics():
+    """Resets the diagnostic counters."""
+    _STATE["diagnostics"] = {
+        "total_calls": 0,
+        "triton_calls": 0,
+        "fallback_calls": 0,
+        "fallback_reasons": {},
+        "last_error": None,
+        "last_traceback": None,
+        "first_fallback_logged": False,
+    }
+
+
+def _record_fallback(reason: str, error: Exception | str | None = None):
+    """Records a fallback event in runtime diagnostics and logs the first occurrence prominently."""
+    diag = _STATE["diagnostics"]
+    diag["fallback_calls"] += 1
+    diag["fallback_reasons"][reason] = diag["fallback_reasons"].get(reason, 0) + 1
+
+    if error:
+        diag["last_error"] = str(error)
+        if isinstance(error, Exception):
+            diag["last_traceback"] = traceback.format_exc()
+        else:
+            diag["last_traceback"] = str(error)
+
+        if not diag["first_fallback_logged"]:
+            diag["first_fallback_logged"] = True
+            logger.warning(
+                f"[sd-forge-triton-int8-gemm] Runtime fallback triggered: {reason} ({error}). "
+                "Subsequent identical fallbacks will be counted in diagnostics."
+            )
+    else:
+        logger.debug(f"[sd-forge-triton-int8-gemm] Expected fallback: {reason}")
 
 
 def _register_custom_ops_for_torch_compile():
@@ -85,7 +140,7 @@ def _register_custom_ops_for_torch_compile():
 
         def patched_convrot_w4a4_forward(input_tensor: torch.Tensor, weight: QuantizedTensor, bias: torch.Tensor | None):
             qweight, wscales = TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
-            params = weight._params
+            params = getattr(weight, "_params", getattr(weight, "params", None))
             return torch.ops.ck.convrot_w4a4_linear(
                 input_tensor,
                 qweight,
@@ -108,12 +163,13 @@ def _register_custom_ops_for_torch_compile():
             )
 
         TensorCoreConvRotW4A4Layout.dequantize = classmethod(patched_dequantize)
-        logger.info("sd-forge-triton-int8-gemm: Successfully registered ConvRot W4A4 custom ops for torch.compile.")
+        logger.info("[sd-forge-triton-int8-gemm] Successfully registered ConvRot W4A4 custom ops for torch.compile.")
     except Exception as e:
-        logger.warning(f"sd-forge-triton-int8-gemm: Failed to register ConvRot W4A4 custom ops ({e}).")
+        logger.warning(f"[sd-forge-triton-int8-gemm] Failed to register ConvRot W4A4 custom ops ({e}).")
 
 
 def apply_triton_gemm_patch():
+    """Hooks into Forge's mixed_precision_ops to route int8_tensorwise layers through Fused Triton GEMM."""
     if _STATE["patched"]:
         return
 
@@ -123,66 +179,149 @@ def apply_triton_gemm_patch():
         import backend.operations
         import backend.operations_mixed_precision as omp
         from backend.operations import main_stream_worker, weights_manual_cast
-        from backend.quant_ops import QuantizedTensor, TensorWiseINT8Layout
+        from backend.quant_ops import QuantizedTensor
 
         orig_fn = omp.mixed_precision_ops
         _STATE["orig_mixed_precision_ops"] = orig_fn
 
         def hooked_mixed_precision_ops(*args, **kwargs):
             cls = orig_fn(*args, **kwargs)
+
+            # Idempotency guard: never double-wrap an already patched class
+            if getattr(cls.Linear.forward, "_is_triton_fused", False):
+                return cls
+
             original_forward = cls.Linear.forward
 
             def triton_fused_linear_forward(self, input, *f_args, **f_kwargs):
+                _STATE["diagnostics"]["total_calls"] += 1
+
                 if not _STATE["enabled"]:
+                    _record_fallback("disabled_by_user")
                     return original_forward(self, input, *f_args, **f_kwargs)
 
-                _use_quantized = (
-                    getattr(self, "layout_type", None) is not None
-                    and not isinstance(input, QuantizedTensor)
-                    and not getattr(self, "_full_precision_mm", False)
-                    and not getattr(self, "forge_force_cast_weights", False)
-                    and len(self.weight_function) == 0
-                    and len(self.bias_function) == 0
-                )
+                # Qualification check: verify that this layer is eligible for fused INT8 execution
+                if getattr(self, "layout_type", None) is None:
+                    _record_fallback("not_quantized_layout")
+                    return original_forward(self, input, *f_args, **f_kwargs)
 
-                is_int8_tensorwise = getattr(self, "quant_format", None) == "int8_tensorwise"
+                if isinstance(input, QuantizedTensor):
+                    _record_fallback("input_already_quantized")
+                    return original_forward(self, input, *f_args, **f_kwargs)
 
-                if _use_quantized and is_int8_tensorwise and isinstance(self.weight, QuantizedTensor):
-                    try:
-                        if self.parameters_manual_cast:
-                            weight, bias, signal = weights_manual_cast(self, x=None, dtype=torch.int8, device=input.device, bias_dtype=input.dtype)
-                            scale = self.weight.params.scale.to(device=input.device, non_blocking=True)
-                        else:
-                            weight, bias, signal = self.weight._qdata, self.bias, None
-                            scale = self.weight.params.scale.to(device=input.device, non_blocking=True)
+                if getattr(self, "_full_precision_mm", False):
+                    _record_fallback("full_precision_mm_forced")
+                    return original_forward(self, input, *f_args, **f_kwargs)
 
-                        if getattr(self.weight.params, "convrot", False):
-                            group_size = getattr(self.weight.params, "convrot_groupsize", 256)
-                            H = build_hadamard(group_size, device=input.device, dtype=input.dtype)
-                            input = rotate_activation(input, H, group_size=group_size)
+                if getattr(self, "forge_force_cast_weights", False):
+                    _record_fallback("forge_force_cast_weights")
+                    return original_forward(self, input, *f_args, **f_kwargs)
 
-                        compute_dtype = input.dtype if input.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+                if len(getattr(self, "weight_function", [])) > 0:
+                    _record_fallback("has_weight_function_lora")
+                    return original_forward(self, input, *f_args, **f_kwargs)
 
-                        with main_stream_worker(weight, bias, signal):
-                            if getattr(self, "_per_row", False) or _STATE["per_row_quant"]:
-                                output = triton_int8_linear_per_row(input, weight, scale, bias, compute_dtype)
-                            else:
-                                output = triton_int8_linear(input, weight, scale, bias, compute_dtype)
+                if len(getattr(self, "bias_function", [])) > 0:
+                    _record_fallback("has_bias_function_lora")
+                    return original_forward(self, input, *f_args, **f_kwargs)
 
-                        return output
-                    except Exception as e:
-                        logger.debug(f"Triton INT8 GEMM fallback to standard linear: {e}")
+                quant_format = getattr(self, "quant_format", None)
+                if quant_format != "int8_tensorwise":
+                    _record_fallback(f"unsupported_quant_format_{quant_format}")
+                    return original_forward(self, input, *f_args, **f_kwargs)
+
+                if not isinstance(self.weight, QuantizedTensor):
+                    _record_fallback("weight_not_quantized_tensor")
+                    return original_forward(self, input, *f_args, **f_kwargs)
+
+                # Execute Fused Triton INT8 GEMM
+                try:
+                    # 1. Cast or fetch weights and bias
+                    if getattr(self, "parameters_manual_cast", False):
+                        weight, bias, signal = weights_manual_cast(
+                            self,
+                            x=None,
+                            dtype=torch.int8,
+                            device=input.device,
+                            bias_dtype=input.dtype,
+                        )
+                    else:
+                        weight, bias, signal = self.weight, self.bias, None
+
+                    # 2. Extract underlying raw int8 tensor (CRITICAL: prevents dtype mismatch in Triton)
+                    raw_weight = getattr(weight, "_qdata", weight)
+                    if hasattr(raw_weight, "_qdata"):
+                        raw_weight = raw_weight._qdata
+
+                    if not isinstance(raw_weight, torch.Tensor) or raw_weight.dtype != torch.int8:
+                        _record_fallback(
+                            "raw_weight_not_int8",
+                            f"Weight extraction resulted in dtype {getattr(raw_weight, 'dtype', type(raw_weight))}"
+                        )
                         return original_forward(self, input, *f_args, **f_kwargs)
 
-                return original_forward(self, input, *f_args, **f_kwargs)
+                    # 3. Defensive scale extraction from either params or _params
+                    params = getattr(self.weight, "params", None) or getattr(self.weight, "_params", None)
+                    scale = getattr(params, "scale", None) if params is not None else None
+                    if scale is None:
+                        scale = getattr(self.weight, "scale", None)
 
+                    if scale is None:
+                        _record_fallback("missing_scale_parameter", "No scale found on weight or weight params")
+                        return original_forward(self, input, *f_args, **f_kwargs)
+
+                    if isinstance(scale, torch.Tensor):
+                        scale = scale.to(device=input.device, non_blocking=True)
+
+                    # 4. Optional Hadamard rotation for ConvRot models
+                    if params is not None and getattr(params, "convrot", False):
+                        group_size = getattr(params, "convrot_groupsize", 256)
+                        H = build_hadamard(group_size, device=input.device, dtype=input.dtype)
+                        input = rotate_activation(input, H, group_size=group_size)
+
+                    compute_dtype = input.dtype if input.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+
+                    # 5. Kernel execution inside stream context
+                    with main_stream_worker(weight, bias, signal):
+                        if getattr(self, "_per_row", False) or _STATE["per_row_quant"]:
+                            output = triton_int8_linear_per_row(input, raw_weight, scale, bias, compute_dtype)
+                        else:
+                            output = triton_int8_linear(input, raw_weight, scale, bias, compute_dtype)
+
+                    _STATE["diagnostics"]["triton_calls"] += 1
+                    return output
+
+                except Exception as e:
+                    _record_fallback("triton_execution_error", e)
+                    return original_forward(self, input, *f_args, **f_kwargs)
+
+            triton_fused_linear_forward._is_triton_fused = True
+            triton_fused_linear_forward._original_forward = original_forward
             cls.Linear.forward = triton_fused_linear_forward
             return cls
 
         omp.mixed_precision_ops = hooked_mixed_precision_ops
         backend.operations.mixed_precision_ops = hooked_mixed_precision_ops
         _STATE["patched"] = True
-        logger.info("sd-forge-triton-int8-gemm: Successfully hooked backend.operations_mixed_precision.mixed_precision_ops with Fused Triton INT8 GEMM.")
+        logger.info("[sd-forge-triton-int8-gemm] Successfully hooked backend.operations_mixed_precision.mixed_precision_ops.")
 
     except Exception as e:
-        logger.warning(f"sd-forge-triton-int8-gemm: Patching failed ({e}), using default linear.")
+        logger.warning(f"[sd-forge-triton-int8-gemm] Patching failed ({e}), using default linear.")
+
+
+def remove_triton_gemm_patch():
+    """Cleanly restores original Forge mixed_precision_ops without leaving orphaned hooks."""
+    if not _STATE["patched"] or _STATE["orig_mixed_precision_ops"] is None:
+        return
+
+    try:
+        import backend.operations
+        import backend.operations_mixed_precision as omp
+
+        omp.mixed_precision_ops = _STATE["orig_mixed_precision_ops"]
+        backend.operations.mixed_precision_ops = _STATE["orig_mixed_precision_ops"]
+        _STATE["patched"] = False
+        _STATE["orig_mixed_precision_ops"] = None
+        logger.info("[sd-forge-triton-int8-gemm] Successfully restored original mixed_precision_ops.")
+    except Exception as e:
+        logger.warning(f"[sd-forge-triton-int8-gemm] Failed to unpatch ({e}).")
