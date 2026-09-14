@@ -28,6 +28,8 @@ _STATE = {
 
 def is_triton_gemm_enabled() -> bool:
     """Returns True if Triton GEMM is enabled and not suppressed by .disabled flag."""
+    if _is_compiling():
+        return _STATE.get("enabled", True)
     if os.path.exists(os.path.join(_EXT_DIR, ".disabled")):
         return False
     return _STATE.get("enabled", True)
@@ -59,8 +61,18 @@ def reset_triton_gemm_diagnostics():
     }
 
 
+def _is_compiling() -> bool:
+    """Returns True if TorchDynamo / torch.compile is currently tracing or compiling."""
+    try:
+        return hasattr(torch.compiler, "is_compiling") and torch.compiler.is_compiling()
+    except Exception:
+        return False
+
+
 def _record_fallback(reason: str, error: Exception | str | None = None):
     """Records a fallback event in runtime diagnostics and logs the first occurrence prominently."""
+    if _is_compiling():
+        return
     diag = _STATE["diagnostics"]
     diag["fallback_calls"] += 1
     diag["fallback_reasons"][reason] = diag["fallback_reasons"].get(reason, 0) + 1
@@ -172,6 +184,72 @@ def _register_custom_ops_for_torch_compile():
     except Exception as e:
         logger.warning(f"[sd-forge-triton-int8-gemm] Failed to register ConvRot W4A4 custom ops ({e}).")
 
+    try:
+        if not hasattr(torch.ops, "triton_gemm") or not hasattr(torch.ops.triton_gemm, "int8_linear"):
+            @torch.library.custom_op("triton_gemm::int8_linear", mutates_args=())
+            def op_triton_int8_linear(
+                x: torch.Tensor,
+                weight: torch.Tensor,
+                weight_scale: torch.Tensor,
+                bias: torch.Tensor | None,
+                compute_dtype: torch.dtype,
+            ) -> torch.Tensor:
+                return triton_int8_linear(x, weight, weight_scale, bias=bias, compute_dtype=compute_dtype)
+
+            @op_triton_int8_linear.register_fake
+            def _(x, weight, weight_scale, bias, compute_dtype):
+                out_features = weight.shape[0]
+                return torch.empty((*x.shape[:-1], out_features), dtype=compute_dtype, device=x.device)
+
+            def _int8_linear_setup_context(ctx, inputs, output):
+                x, weight, weight_scale, bias, compute_dtype = inputs
+                ctx.save_for_backward(weight, weight_scale)
+                ctx.has_bias = bias is not None
+
+            def _int8_linear_backward(ctx, grad_output):
+                weight, weight_scale = ctx.saved_tensors
+                w_dequant = weight.to(grad_output.dtype) * weight_scale
+                grad_x = torch.matmul(grad_output, w_dequant)
+                grad_bias = grad_output.sum(dim=tuple(range(grad_output.ndim - 1))) if ctx.has_bias else None
+                return grad_x, None, None, grad_bias, None
+
+            op_triton_int8_linear.register_autograd(_int8_linear_backward, setup_context=_int8_linear_setup_context)
+
+        if not hasattr(torch.ops, "triton_gemm") or not hasattr(torch.ops.triton_gemm, "int8_linear_per_row"):
+            @torch.library.custom_op("triton_gemm::int8_linear_per_row", mutates_args=())
+            def op_triton_int8_linear_per_row(
+                x: torch.Tensor,
+                weight: torch.Tensor,
+                weight_scale: torch.Tensor,
+                bias: torch.Tensor | None,
+                compute_dtype: torch.dtype,
+            ) -> torch.Tensor:
+                return triton_int8_linear_per_row(x, weight, weight_scale, bias=bias, compute_dtype=compute_dtype)
+
+            @op_triton_int8_linear_per_row.register_fake
+            def _(x, weight, weight_scale, bias, compute_dtype):
+                out_features = weight.shape[0]
+                return torch.empty((*x.shape[:-1], out_features), dtype=compute_dtype, device=x.device)
+
+            def _int8_linear_per_row_setup_context(ctx, inputs, output):
+                x, weight, weight_scale, bias, compute_dtype = inputs
+                ctx.save_for_backward(weight, weight_scale)
+                ctx.has_bias = bias is not None
+
+            def _int8_linear_per_row_backward(ctx, grad_output):
+                weight, weight_scale = ctx.saved_tensors
+                scale_b = weight_scale.view(-1, 1) if weight_scale.ndim == 1 else weight_scale
+                w_dequant = weight.to(grad_output.dtype) * scale_b
+                grad_x = torch.matmul(grad_output, w_dequant)
+                grad_bias = grad_output.sum(dim=tuple(range(grad_output.ndim - 1))) if ctx.has_bias else None
+                return grad_x, None, None, grad_bias, None
+
+            op_triton_int8_linear_per_row.register_autograd(_int8_linear_per_row_backward, setup_context=_int8_linear_per_row_setup_context)
+
+        logger.info("[sd-forge-triton-int8-gemm] Successfully registered Triton INT8 custom ops for torch.compile.")
+    except Exception as e:
+        logger.warning(f"[sd-forge-triton-int8-gemm] Failed to register Triton INT8 custom ops ({e}).")
+
 
 def apply_triton_gemm_patch():
     """Hooks into Forge's mixed_precision_ops to route int8_tensorwise layers through Fused Triton GEMM."""
@@ -199,7 +277,9 @@ def apply_triton_gemm_patch():
             original_forward = cls.Linear.forward
 
             def triton_fused_linear_forward(self, input, *f_args, **f_kwargs):
-                _STATE["diagnostics"]["total_calls"] += 1
+                is_tracing = _is_compiling()
+                if not is_tracing:
+                    _STATE["diagnostics"]["total_calls"] += 1
 
                 if not is_triton_gemm_enabled():
                     _record_fallback("disabled_by_user")
@@ -289,11 +369,18 @@ def apply_triton_gemm_patch():
                     # 5. Kernel execution inside stream context
                     with main_stream_worker(weight, bias, signal):
                         if getattr(self, "_per_row", False) or _STATE["per_row_quant"]:
-                            output = triton_int8_linear_per_row(input, raw_weight, scale, bias, compute_dtype)
+                            if hasattr(torch.ops, "triton_gemm") and hasattr(torch.ops.triton_gemm, "int8_linear_per_row"):
+                                output = torch.ops.triton_gemm.int8_linear_per_row(input, raw_weight, scale, bias, compute_dtype)
+                            else:
+                                output = triton_int8_linear_per_row(input, raw_weight, scale, bias, compute_dtype)
                         else:
-                            output = triton_int8_linear(input, raw_weight, scale, bias, compute_dtype)
+                            if hasattr(torch.ops, "triton_gemm") and hasattr(torch.ops.triton_gemm, "int8_linear"):
+                                output = torch.ops.triton_gemm.int8_linear(input, raw_weight, scale, bias, compute_dtype)
+                            else:
+                                output = triton_int8_linear(input, raw_weight, scale, bias, compute_dtype)
 
-                    _STATE["diagnostics"]["triton_calls"] += 1
+                    if not is_tracing:
+                        _STATE["diagnostics"]["triton_calls"] += 1
                     return output
 
                 except Exception as e:
